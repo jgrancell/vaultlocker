@@ -54,10 +54,54 @@ def _get_vault_path(device_uuid, config):
     :param: config: configparser object of vaultlocker config
     :returns: str: Path to vault resource for device
     """
-    return '{}/{}/{}'.format(config.get('vault', 'backend'),
+    return '{}/{}/{}'.format(config.get('vault', 'secret_prefix'),
                              socket.gethostname(),
                              device_uuid)
 
+def _vault_kv_write(client, config, vault_path, data):
+    try:
+        if config.get('vault', 'kv_version') == 'v2':
+            client.secrets.kv.v2.create_or_update_secret(
+                path=vault_path,
+                secret=data,
+                cas=None,
+                mount_point=config.get('vault', 'kv_mount'),
+            )
+        else:
+            client.secrets.kv.v1.create_or_update_secret(
+                path=vault_path,
+                secret=data,
+                method=None,
+                mount_point=config.get('vault', 'kv_mount'),
+            )
+    except hvac.exceptions.VaultError as write_error:
+        logger.error('Vault write to path {}'
+                     'failed with error: {}'.format(vault_path, write_error))
+        raise exceptions.VaultWriteError(vault_path, write_error)
+
+def _vault_kv_read(client, config, vault_path):
+    try:
+        if config.get('vault', 'kv_version') == 'v2':
+            stored_data = client.secrets.kv.read_secret_version(
+                path=vault_path,
+                version=None,
+                mount_point=config.get('vault', 'kv_mount')
+            )
+            if stored_data is None:
+                raise ValueError('Unable to locate key for {}'.format(vault_path))
+            return stored_data['data']
+        else:
+            stored_data = client.secrets.kv.v1.read_secret(
+                path=vault_path,
+                mount_point=config.get('vault', 'kv_mount')
+            )
+            if stored_data is None:
+                raise ValueError('Unable to locate key for {}'.format(vault_path))
+            return stored_data
+    except hvac.exceptions.VaultError as read_error:
+        logger.error('Vault access to path {}'
+                     'failed with error: {}'.format(vault_path, read_error))
+        raise exceptions.VaultReadError(vault_path, read_error)
 
 def _encrypt_block_device(args, client, config):
     """Encrypt and open a block device
@@ -74,21 +118,9 @@ def _encrypt_block_device(args, client, config):
     vault_path = _get_vault_path(block_uuid, config)
 
     # NOTE: store and validate key before trying to encrypt disk
-    try:
-        client.write(vault_path,
-                     dmcrypt_key=key)
-    except hvac.exceptions.VaultError as write_error:
-        logger.error(
-            'Vault write to path {}. Failed with error: {}'.format(
-                vault_path, write_error))
-        raise exceptions.VaultWriteError(vault_path, write_error)
+    _vault_kv_write(client, config, vault_path, dict(dmcrypt_key=key))
 
-    try:
-        stored_data = client.read(vault_path)
-    except hvac.exceptions.VaultError as read_error:
-        logger.error('Vault access to path {}'
-                     'failed with error: {}'.format(vault_path, read_error))
-        raise exceptions.VaultReadError(vault_path, read_error)
+    stored_data = _vault_kv_read(client, config, vault_path)
 
     if not key == stored_data['data']['dmcrypt_key']:
         raise exceptions.VaultKeyMismatch(vault_path)
@@ -139,9 +171,7 @@ def _decrypt_block_device(args, client, config):
 
     vault_path = _get_vault_path(block_uuid, config)
 
-    stored_data = client.read(vault_path)
-    if stored_data is None:
-        raise ValueError('Unable to locate key for {}'.format(block_uuid))
+    stored_data = _vault_kv_read(client, config, vault_path)
     key = stored_data['data']['dmcrypt_key']
 
     dmcrypt.luks_open(key, block_uuid)
