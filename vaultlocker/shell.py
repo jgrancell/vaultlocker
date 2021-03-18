@@ -103,6 +103,22 @@ def _vault_kv_read(client, config, vault_path):
                      'failed with error: {}'.format(vault_path, read_error))
         raise exceptions.VaultReadError(vault_path, read_error)
 
+def _vault_kv_delete(client, config, vault_path):
+    try:
+        if config.get('vault', 'kv_version') == 'v2':
+            client.secrets.kv.v2.delete_latest_version_of_secret(
+                path=vault_path,
+                mount_point=config.get('vault', 'kv_mount')
+            )
+        else:
+            client.secrets.kv.v1.delete_secret(
+                path=vault_path,
+                mount_point=config.get('vault', 'kv_mount')
+            )
+    except hvac.exceptions.VaultError as delete_error:
+        logger.error('Vault delete to path {}'
+                     'failed with error: {}'.format(vault_path, delete_error))
+        raise exceptions.VaultDeleteError(vault_path, delete_error)
 def _encrypt_block_device(args, client, config):
     """Encrypt and open a block device
 
@@ -144,7 +160,7 @@ def _encrypt_block_device(args, client, config):
                 luks_error.output))
 
         try:
-            client.delete(vault_path)
+            _vault_kv_delete(client, config, vault_path)
         except hvac.exceptions.VaultError as del_error:
             raise exceptions.VaultDeleteError(vault_path, del_error)
 
